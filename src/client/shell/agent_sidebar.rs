@@ -354,7 +354,11 @@ pub(super) fn render_agent_row(
         row.rows.clone()
     };
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
-        let indent = if index == 0 { 1 } else { 3 };
+        let indent = if index == 0 {
+            1
+        } else {
+            usize::from(config.agents.row_indent)
+        };
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
