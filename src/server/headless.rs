@@ -160,11 +160,59 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the idle headless loop wakes to poll the local listener for new
 /// client connections.
 ///
-/// The listener is non-blocking and not integrated into `tokio::select!`, so
-/// a low-frequency wake is required to notice new thin-client attaches while
-/// otherwise idle. Keep this much slower than the old resize-poll cadence to
-/// avoid reintroducing the idle CPU spin.
+/// On Unix the listener's readiness wakes the loop as soon as a client
+/// connects (see `client_listener_readiness`); this poll is the fallback when
+/// that registration is unavailable. Keep this much slower than the old
+/// resize-poll cadence to avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The client listener's fd, registered with the runtime only to learn when a
+/// connection is pending; `client_listener` keeps ownership and does the accept.
+#[cfg(unix)]
+struct ClientListenerFd(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for ClientListenerFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+type ClientListenerReadiness = tokio::io::unix::AsyncFd<ClientListenerFd>;
+#[cfg(not(unix))]
+type ClientListenerReadiness = ();
+
+/// Registers the listener for readiness so an attach to an idle server is
+/// accepted at once instead of on the next `CLIENT_ACCEPT_POLL_INTERVAL` tick.
+#[cfg(unix)]
+fn client_listener_readiness(listener: &LocalListener) -> Option<ClientListenerReadiness> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let interprocess::local_socket::Listener::UdSocket(listener) = listener;
+    let fd = ClientListenerFd(listener.as_fd().as_raw_fd());
+    match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE) {
+        Ok(readiness) => Some(readiness),
+        Err(err) => {
+            warn!(err = %err, "client listener readiness unavailable; polling for attaches");
+            None
+        }
+    }
+}
+
+/// Resolves when a client connection is pending. The readiness is cleared
+/// before the loop drains the listener, so a later connection wakes it again.
+async fn client_listener_readable(readiness: Option<&ClientListenerReadiness>) {
+    #[cfg(unix)]
+    if let Some(readiness) = readiness {
+        if let Ok(mut guard) = readiness.readable().await {
+            guard.clear_ready();
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = readiness;
+    std::future::pending().await
+}
 
 // Split shell redraws need several early updates; sustained output still coalesces.
 const INTERACTIVE_RENDER_BUDGET: u8 = 16;
@@ -430,6 +478,10 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        #[cfg(unix)]
+        let client_listener_ready = client_listener_readiness(&self.client_listener);
+        #[cfg(not(unix))]
+        let client_listener_ready: Option<ClientListenerReadiness> = None;
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -639,6 +691,7 @@ impl HeadlessServer {
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
+                    _ = client_listener_readable(client_listener_ready.as_ref()) => LoopEvent::Timer,
                 }
             };
 
